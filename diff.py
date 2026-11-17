@@ -651,16 +651,19 @@ def get_arch(arch_str: str) -> "ArchSettings":
 BUFFER_CMD: List[str] = ["tail", "-c", str(10**9)]
 
 
-def get_less_cmd(use_alternate_screen: bool) -> List[str]:
+def get_less_cmd() -> List[str]:
     # -S truncates long lines instead of wrapping them
     # -R interprets color escape sequences
     # -i ignores case when searching
-    # -c something about how the screen gets redrawn; I don't remember the purpose
+    # -c clear-screen: make it so that previous output don't linger below new output
     # -#6 makes left/right arrow keys scroll by 6 characters
-
-    # -X sets up the terminal, and -+X does the same terminal setup plus entering alternate
-    # screen.
-    return ["less", "-SRic", "-+F", "-+X" if use_alternate_screen else "-X", "-#6"]
+    # -X sets up the terminal without entering alternate screen, since we handle that ourselves now
+    args = ["less", "-SRic", "-+F", "-X", "-#6"]
+    if sys.platform == "win32":
+        # On Windows, Ctrl-C will do nothing unless we pass -K to let less
+        # terminate when interrupted
+        args.append("-K")
+    return args
 
 
 DEBOUNCE_DELAY: float = 0.1
@@ -4384,18 +4387,21 @@ class Display:
 
         return (output, refresh_key)
 
-    def run_less(
-        self, output: str, use_alternate_screen: bool = True
-    ) -> "Tuple[subprocess.Popen[bytes], subprocess.Popen[bytes]]":
+    def run_less(self, output: str) -> "Tuple[subprocess.Popen[bytes], subprocess.Popen[bytes]]":
         # Pipe the output through 'tail' and only then to less, to ensure the
         # write call doesn't block. ('tail' has to buffer all its input before
         # it starts writing.) This also means we don't have to deal with pipe
         # closure errors.
         buffer_proc = subprocess.Popen(
-            BUFFER_CMD, stdin=subprocess.PIPE, stdout=subprocess.PIPE
+            BUFFER_CMD,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            # some tail implementation (uutils) writes "Broken pipe" over the screen
+            # on SIGPIPE, which can cause flicker
+            stderr=subprocess.DEVNULL,
         )
         less_proc = subprocess.Popen(
-            get_less_cmd(use_alternate_screen), stdin=buffer_proc.stdout
+            get_less_cmd(), stdin=buffer_proc.stdout
         )
         assert buffer_proc.stdin
         assert buffer_proc.stdout
@@ -4406,17 +4412,16 @@ class Display:
 
     def run_sync(self) -> None:
         output, _ = self.run_diff()
-        proca, procb = self.run_less(output)
-        try:
-            procb.wait()
-        except KeyboardInterrupt:
-            # Send SIGTERM to less so it cleans up the terminal on Ctrl-C.
-            # otherwise the terminal will be stuck in echo off
-            procb.terminate()
-            procb.wait()
-            raise
-        finally:
-            proca.wait()
+        with AlternateScreen(self):
+            proca, procb = self.run_less(output)
+            try:
+                procb.wait()
+            except KeyboardInterrupt:
+                procb.terminate()
+                procb.wait()
+                raise
+            finally:
+                proca.wait()
 
     def run_async(self, watch_queue: "queue.Queue[Optional[float]]") -> None:
         self.watch_queue = watch_queue
@@ -4429,10 +4434,7 @@ class Display:
         self.ready_queue.get()
 
     def display_thread(self, initial_output: str) -> None:
-        # when rendering in display thread, we already handled
-        # alternate screen ourselves to prevent flickering,
-        # so let less run without using alternate screen
-        proca, procb = self.run_less(initial_output, use_alternate_screen=False)
+        proca, procb = self.run_less(initial_output)
         self.less_proc = procb
         self.ready_queue.put(None)
         while True:
@@ -4443,7 +4445,7 @@ class Display:
                 # terminated by program with the intent to refresh
                 output = self.pending_update
                 self.pending_update = None
-                proca, procb = self.run_less(output, use_alternate_screen=False)
+                proca, procb = self.run_less(output)
                 self.less_proc = procb
                 self.ready_queue.put(None)
             else:
@@ -4489,9 +4491,9 @@ class Display:
         self.ready_queue.get()
 
 
-class WatchTerminal:
+class AlternateScreen:
     """
-    Object that owns the alternate screen for a watch mode session
+    Object that owns the alternate screen for an interactive session
 
     In watch mode, we set up alternate screen once before running less,
     and tears it down once before exiting. This lets us run less without
@@ -4506,28 +4508,105 @@ class WatchTerminal:
     # switch back to the normal screen
     LEAVE_SEQ = "\x1b[0m\x1b[?1l\x1b>\x1b[?1049l"
 
+    @staticmethod
+    def _write_enter_seq() -> None:
+        sys.stdout.write(AlternateScreen.ENTER_SEQ)
+        sys.stdout.flush()
+
+    @staticmethod
+    def _write_leave_seq() -> None:
+        sys.stdout.write(AlternateScreen.LEAVE_SEQ)
+        sys.stdout.flush()
+
+    # platform-specific console handling
+    # enter() sets up alternate screen and leave() tears it down
+    if sys.platform == "win32":
+        class _ConsoleMode:
+            ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x4
+
+            def __init__(self) -> None:
+                import ctypes
+                from ctypes import wintypes
+                k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+                k32.GetConsoleMode.argtypes = [
+                    wintypes.HANDLE,
+                    ctypes.POINTER(wintypes.DWORD),
+                ]
+                k32.SetConsoleMode.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+                self.k32 = k32
+                self.handle: Optional[int] = None
+                self.saved_mode: Optional[int] = None
+
+            def enter(self) -> bool:
+                import ctypes
+                from ctypes import wintypes
+                import msvcrt
+                handle = msvcrt.get_osfhandle(sys.stdout.fileno())
+                mode = wintypes.DWORD()
+                if not self.k32.GetConsoleMode(handle, ctypes.byref(mode)):
+                    return False
+                vt_mode = mode.value | self.ENABLE_VIRTUAL_TERMINAL_PROCESSING
+                if not self.k32.SetConsoleMode(handle, vt_mode):
+                    return False
+                self.handle = handle
+                self.saved_mode = mode.value
+                AlternateScreen._write_enter_seq()
+                return True
+
+            def leave(self) -> None:
+                if self.saved_mode is None:
+                    return
+                AlternateScreen._write_leave_seq()
+                self.k32.SetConsoleMode(self.handle, self.saved_mode)
+                self.saved_mode = None
+
+    else:
+
+        class _ConsoleMode:
+            """
+            termios handler. The alternate screen is ENTER_SEQ/LEAVE_SEQ, and
+            echo and line mode are turned off while in it, so keys typed while
+            less is restarted aren't echoed onto the screen.
+            """
+
+            def __init__(self) -> None:
+                self.fd = -1
+                self.saved_attrs: Optional[List[Any]] = None
+
+            def enter(self) -> bool:
+                import termios
+
+                self.fd = sys.stdin.fileno()
+                self.saved_attrs = termios.tcgetattr(self.fd)
+                AlternateScreen._write_enter_seq()
+                attrs = termios.tcgetattr(self.fd)
+                # keep ISIG so Ctrl-C and Ctrl-Z still work
+                attrs[3] &= ~(termios.ECHO | termios.ICANON)
+                termios.tcsetattr(self.fd, termios.TCSANOW, attrs)
+                return True
+
+            def leave(self) -> None:
+                if self.saved_attrs is None:
+                    return
+                import termios
+
+                # saved_attrs is kept: after a suspend, leave() runs again on
+                # exit, and re-saving on resume could pick up less's settings
+                AlternateScreen._write_leave_seq()
+                termios.tcsetattr(self.fd, termios.TCSADRAIN, self.saved_attrs)
+
     def __init__(self, display: Display) -> None:
         self.display = display
-        self.fd = -1
-        self.saved_attrs: Optional[List[Any]] = None
+        self.console = self._ConsoleMode()
+        self.entered = False
         self.prev_tstp_handler: Any = None
 
-    def __enter__(self) -> "WatchTerminal":
+    def __enter__(self) -> "AlternateScreen":
         if not (sys.stdin.isatty() and sys.stdout.isatty()):
             return self
-        try:
-            import termios
-        except ImportError:
+        self.entered = self.console.enter()
+        if not self.entered:
             return self
-
-        # save terminal attrs and enter alternate screen
-        self.fd = sys.stdin.fileno()
-        self.saved_attrs = termios.tcgetattr(self.fd)
-        self._write(self.ENTER_SEQ)
-        attrs = termios.tcgetattr(self.fd)
-        # keep ISIG so Ctrl-C and Ctrl-Z still work
-        attrs[3] &= ~(termios.ECHO | termios.ICANON)
-        termios.tcsetattr(self.fd, termios.TCSANOW, attrs)
 
         # register our tstp hook
         if hasattr(signal, "SIGTSTP"):
@@ -4535,32 +4614,21 @@ class WatchTerminal:
         return self
 
     def __exit__(self, *exc_info: object) -> None:
-        if self.saved_attrs is None:
+        if not self.entered:
             return
         if hasattr(signal, "SIGTSTP"):
             signal.signal(signal.SIGTSTP, self.prev_tstp_handler)
-        self._restore()
-
-    def _write(self, seq: str) -> None:
-        sys.stdout.write(seq)
-        sys.stdout.flush()
-
-    def _restore(self) -> None:
-        import termios
-
-        assert self.saved_attrs is not None
-        self._write(self.LEAVE_SEQ)
-        termios.tcsetattr(self.fd, termios.TCSADRAIN, self.saved_attrs)
+        self.console.leave()
+        self.entered = False
 
     def _on_suspend(self, signum: int, frame: object) -> None:
-        # Ctrl-Z goes to the whole process group, so less is stopping itself
-        # in parallel. While doing so it restores the tty settings it saved
-        # at startup (our no-echo ones), so wait for that to finish before
-        # restoring the original ones.
+        # Ctrl-Z goes to the whole process group, so less is stopping itself in parallel.
+        # While doing so it restores the tty settings it saved at startup (our no-echo ones),
+        # so wait for that to finish before restoring the original ones.
         less_proc = self.display.less_proc
         if less_proc is not None:
             _wait_until_stopped(less_proc.pid)
-        self._restore()
+        self.console.leave()
         # restores the tstp hook and suspend
         signal.signal(signal.SIGTSTP, signal.SIG_DFL)
         os.kill(os.getpid(), signal.SIGTSTP)
@@ -4569,9 +4637,10 @@ class WatchTerminal:
 
         # install our signal hook again and enter alternate screen
         signal.signal(signal.SIGTSTP, self._on_suspend)
-        self._write(self.ENTER_SEQ)
-        # less may have repainted before we switched back to the alternate
-        # screen; make it repaint again
+        # only needs to enter, not the full setup, since the original terminal settings are still saved
+        # and a full setup would override those
+        self._write_enter_seq()
+        # less may have repainted before we switched back to the alternate screen; make it repaint again
         less_proc = self.display.less_proc
         if less_proc is not None:
             try:
@@ -4581,7 +4650,7 @@ class WatchTerminal:
 
 
 def _wait_until_stopped(pid: int, timeout: float = 0.2) -> None:
-    """Wait for a process to be stopped by a job-control signal."""
+    """Wait for a process to be stopped by a job-control signal (only used on non-Windows)."""
     stat_path = f"/proc/{pid}/stat"
     if not os.path.exists(stat_path):
         # on system without /proc, just wait for a little bit
@@ -4696,7 +4765,7 @@ def main_late() -> None:
         q: "queue.Queue[Optional[float]]" = queue.Queue()
         debounced_fs_watch(watch_sources, q, config, project)
         last_build = 0.0
-        with WatchTerminal(display):
+        with AlternateScreen(display):
             try:
                 display.run_async(q)
                 while True:
@@ -4721,8 +4790,7 @@ def main_late() -> None:
             except KeyboardInterrupt:
                 pass
             finally:
-                # make sure less is gone before WatchTerminal restores the
-                # terminal, on any exit (e.g. fail() raising SystemExit)
+                # make sure less finished its clean up before we restore the terminal
                 display.terminate()
 
 
