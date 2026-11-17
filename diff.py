@@ -4387,7 +4387,9 @@ class Display:
 
         return (output, refresh_key)
 
-    def run_less(self, output: str) -> "Tuple[subprocess.Popen[bytes], subprocess.Popen[bytes]]":
+    def run_less(
+        self, output: str
+    ) -> "Tuple[subprocess.Popen[bytes], subprocess.Popen[bytes]]":
         # Pipe the output through 'tail' and only then to less, to ensure the
         # write call doesn't block. ('tail' has to buffer all its input before
         # it starts writing.) This also means we don't have to deal with pipe
@@ -4400,9 +4402,7 @@ class Display:
             # on SIGPIPE, which can cause flicker
             stderr=subprocess.DEVNULL,
         )
-        less_proc = subprocess.Popen(
-            get_less_cmd(), stdin=buffer_proc.stdout
-        )
+        less_proc = subprocess.Popen(get_less_cmd(), stdin=buffer_proc.stdout)
         assert buffer_proc.stdin
         assert buffer_proc.stdout
         buffer_proc.stdin.write(output.encode())
@@ -4521,12 +4521,14 @@ class AlternateScreen:
     # platform-specific console handling
     # enter() sets up alternate screen and leave() tears it down
     if sys.platform == "win32":
+
         class _ConsoleMode:
             ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x4
 
             def __init__(self) -> None:
                 import ctypes
                 from ctypes import wintypes
+
                 k32 = ctypes.WinDLL("kernel32", use_last_error=True)
                 k32.GetConsoleMode.argtypes = [
                     wintypes.HANDLE,
@@ -4541,6 +4543,7 @@ class AlternateScreen:
                 import ctypes
                 from ctypes import wintypes
                 import msvcrt
+
                 handle = msvcrt.get_osfhandle(sys.stdout.fileno())
                 mode = wintypes.DWORD()
                 if not self.k32.GetConsoleMode(handle, ctypes.byref(mode)):
